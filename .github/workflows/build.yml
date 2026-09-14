@@ -17,6 +17,6 @@ jobs:
           context: .
           push: true
           platforms: linux/amd64
-          tags: docker.io/${{ secrets.DOCKERHUB_USERNAME }}/athena-cost-demo:0.2.0
+          tags: docker.io/${{ secrets.DOCKERHUB_USERNAME }}/athena-cost-demo:0.2.1
           cache-from: type=gha
           cache-to: type=gha,mode=max
