@@ -1,21 +1,5 @@
 #!/usr/bin/env python3
-"""Interactive one-file demo app for Athena financial-tracking (Epic 10).
-
-Serves a tiny web UI on $PORT. Each time you submit a prompt it calls the
-Amberd LLM gateway, so the gateway's token/duration counters attribute usage
--> cost to this app's namespace. Deploy with "Expose public service" ON to
-reach it at https://<instance_name>.amberd.ai.
-
-Env (LLM_ENDPOINT / LLM_MODEL_NAME are injected by Athena at deploy time;
-provide LLM_API_TOKEN and any override as container Parameters):
-  LLM_ENDPOINT   gateway host:port, e.g. amberd-llm-gateway.tier2.svc:8010
-  LLM_MODEL_NAME model to request, e.g. qwen3-6 / gpt-4o / claude-sonnet-5
-  LLM_API_TOKEN  bearer token for the gateway (if required)
-  LLM_SCHEME     http (default) | https
-  LLM_PATH       request path (default /v1/chat/completions)
-  MAX_TOKENS     max tokens per reply (default 128)
-  PORT           listen port (default 8080)
-"""
+"""Interactive demo app for Athena financial-tracking (Epic 10) + gateway probe."""
 import html, json, os, time, urllib.request, urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs
@@ -33,9 +17,8 @@ stats = {"calls": 0, "errors": 0, "in_tokens": 0, "out_tokens": 0}
 def log(*a):
     print(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), *a, flush=True)
 
-def call_gateway(prompt):
-    """Return (reply_text, usage_dict, error_str)."""
-    url = f"{SCHEME}://{ENDPOINT}{PATH}"
+def call_gateway(prompt, path):
+    url = f"{SCHEME}://{ENDPOINT}{path}"
     body = json.dumps({
         "model": MODEL,
         "messages": [{"role": "user", "content": prompt}],
@@ -58,7 +41,17 @@ def call_gateway(prompt):
         reply = json.dumps(data)[:2000]
     return reply, data.get("usage"), None
 
-def page(prompt="", reply="", usage=None, error=""):
+def probe():
+    url = f"{SCHEME}://{ENDPOINT}/openapi.json"
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            spec = json.loads(resp.read().decode())
+        rows = [f"{m.upper():5} {p}" for p, ms in spec.get("paths", {}).items() for m in ms]
+        return "\n".join(sorted(rows)) or "(no paths in openapi.json)"
+    except Exception as e:
+        return f"could not read {url}\n{type(e).__name__}: {e}\n(try /docs in-cluster)"
+
+def page(prompt="", path=PATH, reply="", usage=None, error=""):
     esc = html.escape
     usage_html = f"<pre>usage: {esc(json.dumps(usage))}</pre>" if usage else ""
     reply_html = f"<h3>Reply</h3><pre style='white-space:pre-wrap'>{esc(reply)}</pre>{usage_html}" if reply else ""
@@ -70,8 +63,12 @@ def page(prompt="", reply="", usage=None, error=""):
 <p style="color:#555">model: <b>{esc(MODEL or '(unset)')}</b> ·
 endpoint: <b>{esc(ENDPOINT or '(unset)')}</b><br>
 calls: {stats['calls']} · errors: {stats['errors']} ·
-tokens in/out: {stats['in_tokens']}/{stats['out_tokens']}</p>
+tokens in/out: {stats['in_tokens']}/{stats['out_tokens']} ·
+<a href="/probe">probe gateway routes</a></p>
 <form method=post action="/chat">
+  <label>Request path:
+    <input name=path value="{esc(path)}" style="width:100%;margin:4px 0 8px">
+  </label>
   <textarea name=prompt rows=4 style="width:100%" placeholder="Type a prompt and press Send">{esc(prompt)}</textarea>
   <button type=submit style="margin-top:8px;padding:8px 16px">Send</button>
 </form>
@@ -80,39 +77,35 @@ tokens in/out: {stats['in_tokens']}/{stats['out_tokens']}</p>
 
 class H(BaseHTTPRequestHandler):
     def _send(self, code, body, ctype="text/html; charset=utf-8"):
-        self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.end_headers()
+        self.send_response(code); self.send_header("Content-Type", ctype); self.end_headers()
         self.wfile.write(body)
 
     def do_GET(self):
         if self.path.startswith("/health"):
-            return self._send(200, json.dumps({"ok": True, **stats}).encode(),
-                              "application/json")
+            return self._send(200, json.dumps({"ok": True, **stats}).encode(), "application/json")
+        if self.path.startswith("/probe"):
+            return self._send(200, ("<pre style='font-family:ui-monospace'>"
+                + html.escape(probe()) + "</pre><p><a href='/'>back</a></p>").encode())
         self._send(200, page())
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length).decode("utf-8", "replace") if length else ""
-        prompt = ""
-        if self.headers.get("Content-Type", "").startswith("application/json"):
-            try: prompt = json.loads(raw).get("prompt", "")
-            except Exception: prompt = ""
-        else:
-            prompt = (parse_qs(raw).get("prompt", [""])[0]).strip()
+        form = parse_qs(raw)
+        prompt = (form.get("prompt", [""])[0]).strip()
+        path = (form.get("path", [PATH])[0]).strip() or PATH
         if not prompt:
-            return self._send(200, page(error="Please enter a prompt."))
-        reply, usage, error = call_gateway(prompt)
+            return self._send(200, page(path=path, error="Please enter a prompt."))
+        reply, usage, error = call_gateway(prompt, path)
         stats["calls"] += 1
         if error:
-            stats["errors"] += 1
-            log("gateway error:", error)
+            stats["errors"] += 1; log("gateway error:", error)
         else:
             if usage:
                 stats["in_tokens"]  += int(usage.get("prompt_tokens", 0) or 0)
                 stats["out_tokens"] += int(usage.get("completion_tokens", 0) or 0)
             log("gateway ok usage=", usage)
-        self._send(200, page(prompt=prompt, reply=reply, usage=usage, error=error))
+        self._send(200, page(prompt=prompt, path=path, reply=reply, usage=usage, error=error))
 
     def log_message(self, *a): pass
 
